@@ -8,6 +8,8 @@ import threading
 import platform
 import subprocess
 import sys
+import tempfile
+import shutil
 
 # pip install python-docx docx2pdf endesive cryptography requests asn1crypto
 # On Windows pip install pywin32
@@ -25,7 +27,7 @@ from cryptography import x509
 class PDFGeneratorApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("ValiDoc 1.0")
+        self.root.title("ValiDoc 1.1 - Generador de PDFs con Firma")
         self.root.geometry("700x550")
         
         # Variables
@@ -36,6 +38,56 @@ class PDFGeneratorApp:
         self.sign_document = tk.BooleanVar(value=True)
         
         self.create_widgets()
+    
+    def _clean_docx_with_libreoffice(self, doc_path_to_clean):
+        """
+        Usa LibreOffice en modo headless para abrir y volver a guardar un DOCX,
+        limpiando así su XML interno.
+        """
+        self.log("🧼 Limpiando la plantilla DOCX con LibreOffice...")
+        
+        # 1. Determinar el ejecutable de LibreOffice según el SO
+        if platform.system() == "Windows":
+            # La ruta puede variar, asegúrate de que esté en el PATH del sistema
+            # o proporciona la ruta completa, ej: "C:/Program Files/LibreOffice/program/soffice.exe"
+            libreoffice_executable = "C:/Program Files/LibreOffice/program/soffice.exe"
+        else: # Linux o macOS
+            libreoffice_executable = "libreoffice"
+
+        # 2. Crear un directorio temporal para guardar el archivo limpio
+        temp_dir = tempfile.mkdtemp()
+        
+        try:
+            # 3. Construir y ejecutar el comando
+            command = [
+                libreoffice_executable,
+                '--headless', # No mostrar la interfaz gráfica
+                '--convert-to', 'docx', # Convertir a formato docx
+                '--outdir', temp_dir, # Directorio de salida
+                doc_path_to_clean # Archivo de entrada
+            ]
+            
+            subprocess.run(command, check=True, capture_output=True, text=True)
+            
+            # 4. Obtener la ruta del nuevo archivo limpio
+            original_filename = os.path.basename(doc_path_to_clean)
+            clean_doc_path = os.path.join(temp_dir, original_filename)
+            
+            if not os.path.exists(clean_doc_path):
+                raise FileNotFoundError("LibreOffice no generó el archivo de salida esperado.")
+            
+            self.log("✨ Plantilla limpiada con éxito.")
+            return clean_doc_path, temp_dir
+
+        except FileNotFoundError:
+            # Este error ocurre si el comando "soffice.exe" o "libreoffice" no se encuentra
+            shutil.rmtree(temp_dir) # Limpiar antes de salir
+            raise Exception(f"Comando '{libreoffice_executable}' no encontrado. Asegúrate de que LibreOffice esté instalado y que su ruta esté en el PATH del sistema.")
+        except subprocess.CalledProcessError as e:
+            # Este error ocurre si LibreOffice devuelve un código de error
+            shutil.rmtree(temp_dir) # Limpiar antes de salir
+            raise Exception(f"Error al ejecutar LibreOffice: {e.stderr}")
+
         
     def create_widgets(self):
         main_frame = ttk.Frame(self.root, padding="20")
@@ -45,7 +97,7 @@ class PDFGeneratorApp:
         self.root.rowconfigure(0, weight=1)
         main_frame.columnconfigure(1, weight=1)
         
-        title_label = ttk.Label(main_frame, text="Generador de PDFs con Firma", font=("Arial", 16, "bold"))
+        title_label = ttk.Label(main_frame, text="ValiDoc 1.1 - Generador de PDFs con Firma", font=("Arial", 16, "bold"))
         title_label.grid(row=0, column=0, columnspan=3, pady=(0, 20))
         
         ttk.Label(main_frame, text="Plantilla Word (.docx):").grid(row=1, column=0, sticky=tk.W, pady=5)
@@ -132,12 +184,18 @@ class PDFGeneratorApp:
             self.root.after(0, lambda: messagebox.showerror("Error", "La firma está activada, pero no ha seleccionado un certificado."))
             return
             
+        temp_dir_path = None # Inicializamos la variable del directorio temporal
         try:
             self.process_btn.config(state='disabled')
             self.progress['value'] = 0
-            self.log("▶️ Iniciando procesamiento...")
             
-            campos = self.extraer_campos_doc(self.doc_path.get())
+            # 1. Limpiar el DOCX antes de empezar a usarlo
+            clean_doc_path, temp_dir_path = self._clean_docx_with_libreoffice(self.doc_path.get())
+            
+            # 2. AHORA, usaremos 'clean_doc_path' para el resto del proceso
+            self.log("▶️ Iniciando procesamiento con la plantilla limpia...")
+            
+            campos = self.extraer_campos_doc(clean_doc_path) # Usar el archivo limpio
             self.log(f"Campos encontrados: {', '.join(campos)}")
             
             datos_csv = self.validar_csv(self.csv_path.get(), campos)
@@ -187,7 +245,8 @@ class PDFGeneratorApp:
                     ruta_pdf_temporal = os.path.join(output_dir, f"temp_{os.path.basename(ruta_final_pdf)}")
                     
                     # Generar el PDF inicial (con el sello visual) en la ruta temporal
-                    self.generar_pdf(self.doc_path.get(), fila, ruta_pdf_temporal, cert_data=cert)
+                    # self.generar_pdf(self.doc_path.get(), fila, ruta_pdf_temporal, cert_data=cert)
+                    self.generar_pdf(clean_doc_path, fila, ruta_pdf_temporal, cert_data=cert) # Usar el archivo limpio
                     
                     # Firmar el PDF temporal y guardarlo en la ruta final definitiva
                     self.log("Firmando PDF...")
@@ -197,7 +256,8 @@ class PDFGeneratorApp:
                     os.remove(ruta_pdf_temporal)
                 else:
                     # Si no se firma, se genera el PDF directamente en su ruta final
-                    self.generar_pdf(self.doc_path.get(), fila, ruta_final_pdf)
+                    # self.generar_pdf(self.doc_path.get(), fila, ruta_final_pdf)
+                    self.generar_pdf(clean_doc_path, fila, ruta_final_pdf) # Usar el archivo limpio
                 
                 self.update_progress(i + 1)
                 
@@ -213,6 +273,10 @@ class PDFGeneratorApp:
             self.root.after(0, lambda: messagebox.showerror("Error", error_message))
             
         finally:
+            if temp_dir_path and os.path.exists(temp_dir_path):
+                shutil.rmtree(temp_dir_path)
+                self.log("🗑️ Archivos temporales eliminados.")
+            
             self.root.after(0, lambda: self.process_btn.config(state='normal'))
             self.update_progress(0)
 
